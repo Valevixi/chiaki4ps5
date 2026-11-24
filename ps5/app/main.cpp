@@ -2154,7 +2154,7 @@ public:
 		else hint = "X  Select      Left / Right  Move      Down  Profiles";
 		UiText(20, 516, hint.c_str(), CDim(), 1);
 		if(active && !status.empty() && status != "Who's playing?") UiTextCentered(486, status.c_str(), CAccent(), 1);
-		UiText(905, 516, "v1.2", CDim(), 1);
+		UiText(905, 516, "v1.1", CDim(), 1);
 		if(!gfx.fgReady) UiText(560, 516, "frame gen unavailable", CDim(), 1);
 	}
 
