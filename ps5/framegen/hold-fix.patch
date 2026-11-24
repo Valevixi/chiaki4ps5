@@ -1,0 +1,51 @@
+--- ffx_frameinterpolation.h.orig	2026-11-24 02:35:10.911428681 +0000
++++ ffx_frameinterpolation.h	2026-11-24 02:39:11.078433590 +0000
+@@ -107,6 +107,12 @@
+ 
+ FFX_STATIC const FfxFloat32 FG_MATCH      = 0.12f; // two samples agree under this (the sum of the 3 channels' differences, 0..3)
+ FFX_STATIC const FfxFloat32 FG_MATCH_SOFT = 0.18f; // and disagree fully from FG_MATCH + this
++#ifndef FG_HOLD
++#define FG_HOLD      0.12f // chiaki-ps5 "hold": a motion that explains neither frame's own pixel here from this much difference...
++#endif
++#ifndef FG_HOLD_SOFT
++#define FG_HOLD_SOFT 0.12f // ...and not at all from FG_HOLD + this
++#endif
+ FFX_STATIC const FfxFloat32 FG_OWN        = 0.20f; // a sample is explained by another motion under this
+ FFX_STATIC const FfxFloat32 FG_NONE       = 1e9f;  // no candidate
+ #define FG_CANDIDATES 12                             // the moving candidates (see computeFrameinterpolationQuad; m74: 10 the last frame's, 11 the refined one)
+@@ -568,6 +574,26 @@
+         FfxFloat32       fErr    = bStill ? px[i].fErr0 : px[i].fErrA;
+         FfxFloat32x3     fColor  = bStill ? FgBlend(px[i].fPrev0, px[i].fCurr0) : FgBlend(px[i].fPrevA, px[i].fCurrA);
+ 
++        // chiaki-ps5 "hold": something that stays on screen (the character the camera follows) covers this pixel in both frames, and
++        // the chosen motion (the background's, as the camera turns) paints the background through it, because the background agrees
++        // with itself on both sides of the character. If the motion were right here, A's own pixel would show up in B moved by it, or
++        // B's own pixel would come from A moved by it. When neither does, the pixel is what both frames show: no motion.
++        FfxFloat32 fHold = 0.0f;
++#if !defined(FG_NO_HOLD)
++        if (!bStill)
++        {
++            const FfxFloat32x2 fD   = px[i].fMvA * (FgTP() + FgTC());
++            const FfxFloat32x2 fUvB = px[i].fUv - fD;
++            const FfxFloat32x2 fUvA = px[i].fUv + fD;
++            if (length(fD * fSize) > 2.0f && IsUvInside(fUvB) && IsUvInside(fUvA))
++            {
++                const FfxFloat32 fExplA = FgDiff(px[i].fPrev0, SampleCurrentBackbuffer(fUvB));
++                const FfxFloat32 fExplB = FgDiff(px[i].fCurr0, SamplePreviousBackbuffer(fUvA));
++                fHold = ffxSaturate((ffxMin(fExplA, fExplB) - FG_HOLD) / FG_HOLD_SOFT);
++            }
++        }
++#endif
++
+ #if !defined(FG_NO_OWN_MATCH)
+         // m73f: the quad's choice does not agree at this pixel, but a motion (or none) does, at this pixel alone: the pixel belongs to
+         // what that motion moves (an ear of a character moving a little, in a quad that is mostly background), not to an edge
+@@ -641,6 +667,8 @@
+             fDebug = ffxLerp(fDebug, ffxLerp(FfxFloat32x3(1.0f, 0.0f, 1.0f), fSideDebug, fSure), fEdge);
+         }
+ 
++        fColor = ffxLerp(fColor, FgBlend(px[i].fPrev0, px[i].fCurr0), fHold);
++        fDebug = ffxLerp(fDebug, FfxFloat32x3(1.0f, 0.9f, 0.0f), fHold); // yellow: held
+         // FFX_FRAMEINTERPOLATION_DISPATCH_DRAW_DEBUG_VIEW: the decisions in colour over the picture's luma
+         if ((GetDispatchFlags() & FFX_FRAMEINTERPOLATION_DISPATCH_DRAW_DEBUG_VIEW) != 0)
+         {

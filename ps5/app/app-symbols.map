@@ -1,0 +1,7 @@
+{
+    local:
+        _Zn*;
+        _Zd*;
+        getnameinfo;
+        __ps5app_getnameinfo;
+};

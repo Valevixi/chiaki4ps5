@@ -349,7 +349,21 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_takion_connect(ChiakiTakion *takion, Chiaki
 			ret = CHIAKI_ERR_NETWORK;
 			goto error_pipe;
 		}
-		const int rcvbuf_val = takion->a_rwnd;
+		int rcvbuf_val = takion->a_rwnd;
+#ifdef CHIAKI_PS5
+		/* A 30+ Mbps stream bursts far past the default window; the receive
+		   thread can't drain it fast enough without a large socket buffer. */
+		{
+			static const int tries[] = { 8 * 1024 * 1024, 4 * 1024 * 1024, 2 * 1024 * 1024, 1024 * 1024 };
+			for(size_t ti = 0; ti < sizeof(tries) / sizeof(tries[0]); ti++)
+				if(setsockopt(takion->sock, SOL_SOCKET, SO_RCVBUF, (const CHIAKI_SOCKET_BUF_TYPE)&tries[ti], sizeof(int)) == 0)
+				{
+					rcvbuf_val = tries[ti];
+					CHIAKI_LOGI(takion->log, "Takion receive buffer set to %d bytes", rcvbuf_val);
+					break;
+				}
+		}
+#endif
 		int r = setsockopt(takion->sock, SOL_SOCKET, SO_RCVBUF, (const CHIAKI_SOCKET_BUF_TYPE)&rcvbuf_val, sizeof(rcvbuf_val));
 		if(r < 0)
 		{
