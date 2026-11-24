@@ -101,6 +101,11 @@ VKFN_DEVICE(VKFN_DEFINE)
 #undef VKFN_DEFINE
 
 // ---------------------------------------------------------------- logging
+#define STB_IMAGE_IMPLEMENTATION
+#define STBI_ONLY_PNG
+#define STBI_NO_SIMD
+#include "stb_image.h"
+
 static const char *DATA_DIR = "/data/chiaki-ps5";
 static std::mutex g_logMutex;
 static FILE *g_logFile = nullptr;
@@ -370,6 +375,42 @@ static void Blend(int x, int y, uint32_t c, int a)
 		out[i] = (sc * sa + dc * da * (255 - sa) / 255) / oa;
 	}
 	d = RGBA(out[0], out[1], out[2], oa);
+}
+
+// ---- chiaki-ng look (Material dark, accent #00a7ff), drawn in 960x540 units
+struct UiImg { int w = 0, h = 0; std::vector<uint8_t> px; };
+static UiImg g_imgConsole, g_imgLogo;
+
+static void UiRoundRect(int x, int y, int w, int h, int r, uint32_t c)
+{
+	int x0 = x * U, y0 = y * U, x1 = (x + w) * U, y1 = (y + h) * U, rr = r * U;
+	for(int yy = y0; yy < y1; yy++)
+		for(int xx = x0; xx < x1; xx++)
+		{
+			int cx = xx < x0 + rr ? x0 + rr : (xx >= x1 - rr ? x1 - rr - 1 : xx);
+			int cy = yy < y0 + rr ? y0 + rr : (yy >= y1 - rr ? y1 - rr - 1 : yy);
+			int a = 255;
+			if(cx != xx || cy != yy)
+			{
+				float dx = (float)(xx - cx), dy = (float)(yy - cy);
+				float d = sqrtf(dx * dx + dy * dy) - (float)rr;
+				if(d > 0.5f) continue;
+				if(d > -0.5f) a = (int)((0.5f - d) * 255.0f);
+			}
+			Blend(xx, yy, c, a);
+		}
+}
+
+static void UiImage(const UiImg &img, int x, int y, float opacity)
+{
+	if(img.px.empty()) return;
+	int bx = x * U, by = y * U, o = (int)(opacity * 255.0f);
+	for(int yy = 0; yy < img.h; yy++)
+		for(int xx = 0; xx < img.w; xx++)
+		{
+			const uint8_t *p = &img.px[(yy * img.w + xx) * 4];
+			if(p[3]) Blend(bx + xx, by + yy, RGBA(p[0], p[1], p[2], 255), p[3] * o / 255);
+		}
 }
 
 static void UiRect(int x, int y, int w, int h, uint32_t c)
@@ -1218,6 +1259,14 @@ public:
 		set = LoadSettings();
 		cfg = LoadConfig();
 		FontInit();
+		auto loadImg = [](const char *path, UiImg &img) {
+			int n = 0;
+			uint8_t *d = stbi_load(path, &img.w, &img.h, &n, 4);
+			if(d) { img.px.assign(d, d + img.w * img.h * 4); stbi_image_free(d); }
+			AppLog("image %s: %dx%d %s", path, img.w, img.h, d ? "ok" : "missing");
+		};
+		loadImg("/app0/assets/ui/ps5.png", g_imgConsole);
+		loadImg("/app0/assets/ui/logo.png", g_imgLogo);
 
 		sceUserServiceInitialize(nullptr);
 		sceUserServiceGetInitialUser(&userId);
@@ -1381,10 +1430,11 @@ public:
 	}
 
 	// The main page: the profiles, then "+ Add profile" (up to 6 profiles), "Console IP" and "Controls & help".
-	int ItemAdd() { return cfg.profiles.size() < 6 ? (int)cfg.profiles.size() : -1; }
-	int ItemIp() { return (int)cfg.profiles.size() + (ItemAdd() >= 0 ? 1 : 0); }
-	int ItemHelp() { return ItemIp() + 1; }
-	int ProfileItems() { return ItemHelp() + 1; }
+	// toolbar buttons follow the profiles in the focus order
+	int ItemAdd() { return (int)cfg.profiles.size(); }
+	int ItemIp() { return ItemAdd() + 1; }
+	int ItemHelp() { return ItemAdd() + 2; }
+	int ProfileItems() { return ItemAdd() + 3; }
 
 	void OpenKeyboard(std::string *target, const std::string &title, int mode, size_t maxLen, State back)
 	{
@@ -1876,14 +1926,31 @@ public:
 		}
 		if(st == State::ProfileSelect)
 		{
-			int n = ProfileItems();
-			if(pressed & PAD_UP) { profileIdx = (profileIdx + n - 1) % n; uiDirty = true; }
-			if(pressed & PAD_DOWN) { profileIdx = (profileIdx + 1) % n; uiDirty = true; }
-			bool isProfile = profileIdx < (int)cfg.profiles.size();
+			int np = (int)cfg.profiles.size();
+			bool inBar = profileIdx >= np;
+			if(pressed & PAD_UP)
+			{
+				if(!inBar) profileIdx = profileIdx == 0 ? ItemAdd() : profileIdx - 1;
+				else if(np) profileIdx = np - 1;
+				uiDirty = true;
+			}
+			if(pressed & PAD_DOWN)
+			{
+				if(inBar) { if(np) profileIdx = 0; }
+				else profileIdx = profileIdx + 1 < np ? profileIdx + 1 : ItemAdd();
+				uiDirty = true;
+			}
+			if(inBar && (pressed & PAD_LEFT)) { profileIdx = profileIdx > ItemAdd() ? profileIdx - 1 : ItemHelp(); uiDirty = true; }
+			if(inBar && (pressed & PAD_RIGHT)) { profileIdx = profileIdx < ItemHelp() ? profileIdx + 1 : ItemAdd(); uiDirty = true; }
+			bool isProfile = profileIdx < np;
 			if(pressed & PAD_CROSS)
 			{
 				if(isProfile) ChooseProfile(profileIdx);
-				else if(profileIdx == ItemAdd()) OpenEditor(-1);
+				else if(profileIdx == ItemAdd())
+				{
+					if(np >= 8) Status("You can have up to 8 profiles");
+					else OpenEditor(-1);
+				}
 				else if(profileIdx == ItemIp()) OpenKeyboard(&cfg.host, "Console IP (the PS5 you stream from)", 1, 15, State::ProfileSelect);
 				else if(profileIdx == ItemHelp()) { state = State::Help; uiDirty = true; }
 			}
@@ -1943,7 +2010,192 @@ public:
 		}
 	}
 
-	// ---- UI drawing
+	// ---- UI drawing (chiaki-ng style)
+	static uint32_t CBg() { return RGBA(48, 48, 48, 255); }
+	static uint32_t CBar() { return RGBA(33, 33, 33, 255); }
+	static uint32_t CSurface() { return RGBA(66, 66, 66, 255); }
+	static uint32_t CAccent() { return RGBA(0, 167, 255, 255); }
+	static uint32_t CText() { return RGBA(255, 255, 255, 255); }
+	static uint32_t CDim() { return RGBA(179, 179, 179, 255); }
+	static uint32_t CBtn() { return RGBA(88, 88, 88, 255); }
+
+	static void Button(int x, int y, int w, int h, const char *label, bool focus, uint32_t text = 0)
+	{
+		UiRoundRect(x, y, w, h, 6, focus ? CAccent() : CBtn());
+		int tw = UiTextWidth(label, 1);
+		UiText(x + (w - tw) / 2, y + (h - 14) / 2, label, text ? text : CText(), 1);
+	}
+
+	static void Field(int x, int y, int w, const char *label, const std::string &value, const char *empty, bool focus)
+	{
+		UiText(x, y, label, focus ? CAccent() : CDim(), 1);
+		UiRoundRect(x, y + 18, w, 38, 4, RGBA(255, 255, 255, focus ? 34 : 20));
+		UiRect(x, y + 54, w, focus ? 2 : 1, focus ? CAccent() : RGBA(255, 255, 255, 90));
+		UiText(x + 12, y + 30, value.empty() ? empty : value.c_str(), value.empty() ? CDim() : CText(), 1);
+	}
+
+	void Dialog(int x, int y, int w, int h, const char *title)
+	{
+		UiRoundRect(x + 2, y + 4, w, h, 10, RGBA(0, 0, 0, 90));
+		UiRoundRect(x, y, w, h, 10, CSurface());
+		UiText(x + 24, y + 18, title, CText(), 2);
+	}
+
+	void DrawMainPage(const std::string &status, bool active)
+	{
+		UiRect(0, 0, 960, 540, CBg());
+		UiImage(g_imgLogo, 480 - g_imgLogo.w / (2 * U), 290 - g_imgLogo.h / (2 * U), 0.13f);
+
+		// toolbar
+		UiRect(0, 0, 960, 56, CBar());
+		UiRect(0, 56, 960, 2, RGBA(0, 0, 0, 70));
+		UiText(20, 14, "chiaki4ps5", CText(), 2);
+		int np = (int)cfg.profiles.size();
+		Button(545, 10, 160, 36, "+ Add Profile", active && profileIdx == ItemAdd());
+		std::string ip = cfg.host.empty() ? "Console IP" : cfg.host;
+		Button(715, 10, 140, 36, ip.c_str(), active && profileIdx == ItemIp());
+		Button(865, 10, 80, 36, "Help", active && profileIdx == ItemHelp());
+
+		// the profiles, like chiaki-ng's console list
+		if(np == 0)
+		{
+			UiTextCentered(240, "No profiles yet", CText(), 2);
+			UiTextCentered(280, cfg.host.empty() ? "Set your Console IP, then choose + Add Profile at the top"
+				: "Choose + Add Profile at the top to get started", CDim(), 1);
+		}
+		int step = np <= 4 ? 100 : (np <= 5 ? 88 : 440 / np);
+		for(int i = 0; i < np; i++)
+		{
+			int y = 62 + i * step;
+			bool sel = active && i == profileIdx;
+			if(sel)
+			{
+				UiRect(0, y, 960, step, RGBA(255, 255, 255, 30));
+				UiRect(0, y, 5, step, CAccent());
+			}
+			if(i > 0) UiRect(20, y, 920, 1, RGBA(255, 255, 255, 18));
+			UiImage(g_imgConsole, 30, y + (step - g_imgConsole.h / U) / 2, 1.0f);
+			const Profile &p = cfg.profiles[i];
+			bool linked = false;
+			{ ChiakiRegisteredHost tmp; linked = LoadHost(p.name, &tmp); }
+			int ty = y + step / 2 - 30;
+			UiText(220, ty, p.name.c_str(), CText(), 2);
+			std::string addr = "Address: " + (cfg.host.empty() ? std::string("not set") : cfg.host);
+			UiText(220, ty + 34, addr.c_str(), CDim(), 1);
+			UiText(220, ty + 52, linked ? "ID: registered" : "ID: unregistered", CDim(), 1);
+			UiText(620, y + step / 2 - 8, linked ? "State: ready" : "State: link with PIN", linked ? CText() : CDim(), 1);
+		}
+
+		// status bar
+		std::string hint;
+		if(!active) hint = "";
+		else if(profileIdx < np) hint = "X  Connect      Triangle  Edit / delete      Up / Down  Move";
+		else hint = "X  Select      Left / Right  Move      Down  Profiles";
+		UiText(20, 516, hint.c_str(), CDim(), 1);
+		if(active && !status.empty() && status != "Who's playing?") UiTextCentered(486, status.c_str(), CAccent(), 1);
+		UiText(905, 516, "v1.1", CDim(), 1);
+		if(!gfx.fgReady) UiText(560, 516, "frame gen unavailable", CDim(), 1);
+	}
+
+	void DrawEditDialog()
+	{
+		Dialog(180, 50, 600, 440, editIdx >= 0 ? "Edit Profile" : "Add Profile");
+		Field(204, 104, 552, "Name", editName, "Enter a name", editSel == 0);
+		Field(204, 172, 552, "PSN Account ID", editAcc, "base64 (AbCdEfGhIjk=) or number", editSel == 1);
+		Button(204, 244, 552, 38, "Fill in from this PS5's signed-in account", editSel == 2);
+		Button(204, 296, editIdx >= 0 ? 268 : 552, 38, "Save", editSel == 3);
+		if(editIdx >= 0) Button(488, 296, 268, 38, "Delete Profile", editSel == 4, editSel == 4 ? 0 : RGBA(255, 140, 120, 255));
+		if(!editMsg.empty()) UiTextCentered(348, editMsg.c_str(), CAccent(), 1);
+		UiTextWrapped(372, "Use the PSN account signed in on the PS5 you stream from. If it's the same account as this PS5, "
+			"use Fill in. Otherwise type its account ID.", CDim(), 1, 540);
+		UiTextCentered(464, "X  Select      O  Back", CDim(), 1);
+	}
+
+	void DrawKeyboardDialog()
+	{
+		Dialog(150, 40, 660, 460, kbTitle.c_str());
+		UiRoundRect(174, 92, 612, 46, 4, RGBA(255, 255, 255, 30));
+		UiRect(174, 136, 612, 2, CAccent());
+		std::string shown = kbBuf + "_";
+		UiText(188, 102, shown.c_str(), CText(), 2);
+		const auto &rows = KbRows(kbMode);
+		for(int r = 0; r <= (int)rows.size(); r++)
+		{
+			bool act = r == (int)rows.size();
+			int len = KbRowLen(r);
+			int w = act ? (kbMode == 1 ? 150 : 132) : 54, gap = 6;
+			int total = len * (w + gap) - gap, x0 = 480 - total / 2, y = 156 + r * 52;
+			for(int c = 0; c < len; c++)
+			{
+				bool sel = r == kbRow && c == kbCol;
+				int x = x0 + c * (w + gap);
+				bool on = act && KbActions(kbMode)[c] == "Shift" && kbShift;
+				UiRoundRect(x, y, w, 44, 6, sel ? CAccent() : (on ? RGBA(0, 110, 170, 255) : CBtn()));
+				std::string label;
+				if(act) label = KbActions(kbMode)[c];
+				else { char ch = rows[r][c]; if(kbShift && ch >= 'a' && ch <= 'z') ch = (char)(ch - 'a' + 'A'); label = std::string(1, ch); }
+				int tw = UiTextWidth(label.c_str(), act ? 1 : 2);
+				UiText(x + (w - tw) / 2, y + (act ? 14 : 8), label.c_str(), CText(), act ? 1 : 2);
+			}
+		}
+		UiTextCentered(474, kbMode == 1 ? "X  Type      Square  Delete      Options  Done      O  Cancel"
+			: "X  Type    Square  Delete    Triangle  Space    L1/R1  Shift    Options  Done    O  Cancel", CDim(), 1);
+	}
+
+	void DrawHelpDialog()
+	{
+		Dialog(90, 40, 780, 460, "Controls & Help");
+		const char *lines[] = {
+			"While streaming",
+			"Hold Options + press D-pad Up: open / close the settings menu",
+			"Hold Options + press D-pad Down: PS button on the streamed PS5",
+			"Tap Options: Options in the game",
+			"Settings menu: Up/Down choose, Left/Right change, X select, O close",
+			"",
+			"Setting up",
+			"1. Console IP: the PS5 you stream from (on it: Settings > Network > Connection Status)",
+			"2. + Add Profile: a name and the PSN account ID signed in on that PS5",
+			"3. Pick the profile. On the other PS5 open Settings > System > Remote Play >",
+			"    Link Device, and enter the PIN it shows here (only the first time)",
+		};
+		int y = 92;
+		for(const char *l : lines)
+		{
+			bool head = !strcmp(l, "While streaming") || !strcmp(l, "Setting up");
+			UiText(118, y, l, head ? CAccent() : CText(), 1);
+			y += *l ? 28 : 14;
+		}
+		UiTextCentered(474, "O  Back", CDim(), 1);
+	}
+
+	void DrawPinDialog(const std::string &s)
+	{
+		Dialog(160, 100, 640, 330, "Link Profile");
+		UiTextWrapped(150, s, CDim(), 1, 580);
+		for(int i = 0; i < 8; i++)
+		{
+			int x = 480 - 4 * 68 + i * 68 + 4, y = 224;
+			UiRoundRect(x, y, 60, 76, 6, i == pinCursor ? CAccent() : RGBA(255, 255, 255, 26));
+			char d[2] = {(char)('0' + pinDigits[i]), 0};
+			UiText(x + 20, y + 16, d, CText(), 3);
+		}
+		UiTextCentered(330, "Left/Right  Move      Up/Down  Change digit", CDim(), 1);
+		UiTextCentered(352, "X  Register      O  Back", CDim(), 1);
+	}
+
+	void DrawStatusDialog(const std::string &s, State st)
+	{
+		const char *title = st == State::Error ? "Disconnected" : (st == State::Registering ? "Registering" : "Connecting");
+		Dialog(220, 170, 520, 200, title);
+		UiTextWrapped(222, s, st == State::Error ? RGBA(255, 150, 130, 255) : CText(), 1, 470);
+		if(st == State::Error) UiTextCentered(336, "X  Retry      O  Back to profiles", CDim(), 1);
+		else
+		{
+			int phase = (int)(NowUs() / 300000) % 4;
+			for(int i = 0; i < 3; i++) UiRoundRect(462 + i * 14, 330, 8, 8, 4, i < phase ? CAccent() : RGBA(255, 255, 255, 50));
+		}
+	}
+
 	void DrawUi()
 	{
 		UiClear();
@@ -1951,118 +2203,14 @@ public:
 		uint32_t white = RGBA(235, 235, 240, 255), dim = RGBA(150, 150, 165, 255), accent = RGBA(80, 160, 255, 255);
 		if(st != State::Streaming)
 		{
-			UiText(24, 20, "chiaki-ps5", accent, 2);
-			UiText(24, 52, "PS5 Remote Play", dim, 1);
 			std::string s = GetStatus();
-			if(st == State::ProfileSelect)
-			{
-				UiTextCentered(110, s.c_str(), white, 2);
-				int n = ProfileItems();
-				int step = n > 7 ? 38 : 44;
-				for(int i = 0; i < n; i++)
-				{
-					int y = 170 + i * step;
-					bool sel = i == profileIdx;
-					bool isProfile = i < (int)cfg.profiles.size();
-					std::string label;
-					if(isProfile) label = cfg.profiles[i].name;
-					else if(i == ItemAdd()) label = "+ Add profile";
-					else if(i == ItemIp()) label = "Console IP: " + (cfg.host.empty() ? std::string("not set") : cfg.host);
-					else label = "Controls & help";
-					if(sel) UiRect(300, y - 7, 360, 36, RGBA(40, 90, 170, 220));
-					UiTextCentered(y, label.c_str(), isProfile ? white : (sel ? white : dim), isProfile ? 2 : 1);
-				}
-				UiTextCentered(500, profileIdx < (int)cfg.profiles.size() ? "Up/Down: choose    X: play    Triangle: edit / delete" : "Up/Down: choose    X: select", dim, 1);
-			}
-			else if(st == State::EditProfile)
-			{
-				UiTextCentered(100, editIdx >= 0 ? "Edit profile" : "New profile", white, 2);
-				const char *accShow = editAcc.empty() ? "not set" : editAcc.c_str();
-				std::string items[5] = {"Name: " + (editName.empty() ? std::string("not set") : editName), std::string("PSN account ID: ") + accShow,
-					"Fill in from this PS5's signed-in account", "Save", "Delete profile"};
-				for(int i = 0; i < EditItems(); i++)
-				{
-					int y = 160 + i * 46;
-					if(i == editSel) UiRect(220, y - 8, 520, 38, RGBA(40, 90, 170, 220));
-					UiTextCentered(y, items[i].c_str(), i == 4 ? RGBA(255, 150, 130, 255) : white, 1);
-				}
-				if(!editMsg.empty()) UiTextCentered(400, editMsg.c_str(), accent, 1);
-				UiTextWrapped(428, "Use the PSN account that's signed in on the PS5 you stream from. If it's the same account as this PS5, "
-					"use \"Fill in from this PS5\". Otherwise type its account ID (base64, like AbCdEfGhIjk=, or the number).", dim, 1, 820);
-				UiTextCentered(510, "X: select    O: back", dim, 1);
-			}
-			else if(st == State::Keyboard)
-			{
-				UiTextCentered(96, kbTitle.c_str(), white, 2);
-				UiRect(180, 140, 600, 44, RGBA(30, 30, 42, 240));
-				std::string shown = kbBuf + "_";
-				UiText(196, 152, shown.c_str(), white, 2);
-				const auto &rows = KbRows(kbMode);
-				for(int r = 0; r <= (int)rows.size(); r++)
-				{
-					bool act = r == (int)rows.size();
-					int len = KbRowLen(r);
-					int w = act ? (kbMode == 1 ? 150 : 132) : 56, gap = 6;
-					int total = len * (w + gap) - gap, x0 = 480 - total / 2, y = 208 + r * 52;
-					for(int c = 0; c < len; c++)
-					{
-						bool sel = r == kbRow && c == kbCol;
-						int x = x0 + c * (w + gap);
-						bool on = act && KbActions(kbMode)[c] == "Shift" && kbShift;
-						UiRect(x, y, w, 44, sel ? RGBA(40, 90, 170, 240) : (on ? RGBA(70, 70, 100, 240) : RGBA(44, 44, 58, 235)));
-						std::string label;
-						if(act) label = KbActions(kbMode)[c];
-						else { char ch = rows[r][c]; if(kbShift && ch >= 'a' && ch <= 'z') ch = (char)(ch - 'a' + 'A'); label = std::string(1, ch); }
-						int tw = UiTextWidth(label.c_str(), act ? 1 : 2);
-						UiText(x + (w - tw) / 2, y + (act ? 14 : 8), label.c_str(), white, act ? 1 : 2);
-					}
-				}
-				UiTextCentered(500, kbMode == 1 ? "X: type    Square: delete    Options: done    O: cancel"
-					: "X: type    Square: delete    Triangle: space    L1/R1: shift    Options: done    O: cancel", dim, 1);
-			}
-			else if(st == State::Help)
-			{
-				UiTextCentered(90, "Controls & help", white, 2);
-				const char *lines[] = {
-					"While streaming",
-					"Hold Options + press D-pad Up: open / close the settings menu",
-					"Hold Options + press D-pad Down: PS button on the streamed PS5",
-					"Tap Options: Options in the game",
-					"Settings menu: Up/Down choose, Left/Right change, X select, O close",
-					"",
-					"Setting up",
-					"1. Console IP: the PS5 you stream from (on it: Settings > Network > Connection status)",
-					"2. Add a profile: a name and the PSN account ID signed in on that PS5",
-					"3. Pick the profile. On the other PS5 open Settings > System > Remote Play >",
-					"    Link Device, and enter the PIN it shows here (only the first time)",
-				};
-				int y = 140;
-				for(const char *l : lines)
-				{
-					bool head = !strcmp(l, "While streaming") || !strcmp(l, "Setting up");
-					UiText(120, y, l, head ? accent : white, 1);
-					y += *l ? 26 : 14;
-				}
-				UiTextCentered(500, "O: back", dim, 1);
-			}
-			else if(st == State::PinEntry)
-			{
-				UiTextWrapped(130, s, white, 1, 820);
-				for(int i = 0; i < 8; i++)
-				{
-					int x = 480 - 4 * 70 + i * 70 + 5, y = 230;
-					UiRect(x, y, 60, 76, i == pinCursor ? RGBA(40, 90, 170, 230) : RGBA(40, 40, 52, 230));
-					char d[2] = {(char)('0' + pinDigits[i]), 0};
-					UiText(x + 20, y + 16, d, white, 3);
-				}
-				UiTextCentered(360, "Left/Right: move   Up/Down: change digit   X: register   O: back", dim, 1);
-			}
-			else
-			{
-				UiTextWrapped(220, s, st == State::Error ? RGBA(255, 140, 120, 255) : white, 2, 860);
-				if(st == State::Error) UiTextCentered(470, "X: retry    O: back to profiles", dim, 1);
-			}
-			if(!gfx.fgReady) UiText(24, 515, "frame gen unavailable on this build", dim, 1);
+			DrawMainPage(s, st == State::ProfileSelect);
+			if(st != State::ProfileSelect) UiRect(0, 0, 960, 540, RGBA(0, 0, 0, 140));
+			if(st == State::EditProfile) DrawEditDialog();
+			else if(st == State::Keyboard) DrawKeyboardDialog();
+			else if(st == State::Help) DrawHelpDialog();
+			else if(st == State::PinEntry) DrawPinDialog(s);
+			else if(st != State::ProfileSelect) DrawStatusDialog(s, st);
 		}
 		else
 		{
@@ -2070,22 +2218,23 @@ public:
 			{
 				char f[64];
 				snprintf(f, sizeof(f), "%d fps  (%d shown)", fpsShown, fpsShownOut);
-				UiRect(UI_W / U - 190, 8, 182, 22, RGBA(0, 0, 0, 150));
+				UiRoundRect(UI_W / U - 190, 8, 182, 22, 11, RGBA(0, 0, 0, 150));
 				UiText(UI_W / U - 184, 12, f, RGBA(120, 255, 140, 255), 1);
 			}
 			if(menuOpen)
 			{
-				UiRect(560, 30, 380, 490, RGBA(12, 12, 20, 215));
-				UiText(580, 40, "Settings", accent, 2);
+				UiRoundRect(560, 30, 380, 490, 10, RGBA(48, 48, 48, 235));
+				UiText(580, 42, "Settings", RGBA(255, 255, 255, 255), 2);
+				UiRect(580, 74, 340, 2, RGBA(0, 167, 255, 255));
 				for(int i = 0; i < MENU_ITEMS; i++)
 				{
 					int y = 84 + i * 29;
-					if(i == menuIdx) UiRect(570, y - 5, 360, 26, RGBA(40, 90, 170, 230));
+					if(i == menuIdx) UiRoundRect(570, y - 5, 360, 26, 5, RGBA(0, 167, 255, 255));
 					UiText(584, y, MenuLabel(i).c_str(), white, 1);
 				}
 				UiText(580, 462, "* applies on reconnect", dim, 1);
 				UiText(580, 480, "Up/Down  Left/Right  X  O: close", dim, 1);
-				UiText(580, 498, "Options+Up: menu   Options+Down: PS", accent, 1);
+				UiText(580, 498, "Options+Up: menu   Options+Down: PS", RGBA(0, 167, 255, 255), 1);
 			}
 		}
 		memcpy((uint8_t *)gfx.staging[gfx.slot].map + gfx.UiOffset(), g_ui.data(), g_ui.size() * 4);
@@ -2164,6 +2313,13 @@ public:
 				memcpy(gfx.staging[s].map, frameBuf.data(), (size_t)w * h * 3 / 2);
 				haveVideo = true;
 				fpsFrames++;
+			}
+			{
+				// the connecting dots move: redraw a few times a second while connecting
+				State cs = state;
+				static uint64_t lastAnim = 0;
+				uint64_t tn = NowUs();
+				if((cs == State::Connecting || cs == State::Registering) && tn - lastAnim > 300000) { lastAnim = tn; uiDirty = true; }
 			}
 			bool uploadUi = uiDirty || !uiUploadedSlot[s];
 			if(uiDirty) { DrawUi(); uiUploadedSlot[0] = uiUploadedSlot[1] = false; uiDirty = false; }

@@ -62,6 +62,7 @@ mkdir -p "$app/sce_sys" "$app/sce_module"
 "$tool" self --sign --in "$work/eboot.elf" --out "$app/eboot.bin" --magic 0x1D3D154F
 cp "$here/param.json" "$app/sce_sys/param.json"
 cp "$here/assets/icon0.png" "$app/sce_sys/icon0.png"
+mkdir -p "$app/assets/ui" && cp "$here"/assets/ui/*.png "$app/assets/ui/"
 cp "$root/runtime/libc.prx" "$app/sce_module/libc.prx"
 "$tool" self --inspect --file "$app/eboot.bin" >/dev/null
 echo "built $app ($(stat -c %s "$app/eboot.bin") bytes)"
