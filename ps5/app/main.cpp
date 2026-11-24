@@ -101,6 +101,9 @@ VKFN_DEVICE(VKFN_DEFINE)
 #undef VKFN_DEFINE
 
 // ---------------------------------------------------------------- logging
+#include <sys/param.h>
+#include <sys/cpuset.h>
+#include <unistd.h>
 #define STB_IMAGE_IMPLEMENTATION
 #define STBI_ONLY_PNG
 #define STBI_NO_SIMD
@@ -248,7 +251,9 @@ struct Settings
 	int boost = 1;     // 0 off, 1 low, 2 high
 	int framegen = 0;  // 0 off, 1 30->60, 2 60->120
 	int fps = 0;       // show fps counter
-	int res720 = 0;    // 0 1080p, 1 720p
+	int res720 = 0;    // old setting (0 1080p, 1 720p), read for compatibility
+	int res = 1;       // 0 720p, 1 1080p, 2 1440p, 3 4K
+	int decmode = 0;   // decoder: 0 lowest latency, 1 fast (2 frame threads), 2 fastest (4 frame threads)
 	int bitrate = 3;   // index into kBitrates
 	int h264 = 0;      // 0 HEVC, 1 H.264
 	int hz120 = 0;     // 1: use the 1080p 120 Hz output mode (restart app)
@@ -262,8 +267,8 @@ static void SaveSettings(const Settings &s)
 {
 	FILE *f = fopen(SettingsPath().c_str(), "w");
 	if(!f) return;
-	fprintf(f, "restore=%d\ndeband=%d\nsharpen=%d\nboost=%d\nframegen=%d\nfps=%d\nres720=%d\nbitrate=%d\nh264=%d\nhz120=%d\n",
-		s.restore, s.deband, s.sharpen, s.boost, s.framegen, s.fps, s.res720, s.bitrate, s.h264, s.hz120);
+	fprintf(f, "restore=%d\ndeband=%d\nsharpen=%d\nboost=%d\nframegen=%d\nfps=%d\nres=%d\nbitrate=%d\nh264=%d\nhz120=%d\ndecmode=%d\n",
+		s.restore, s.deband, s.sharpen, s.boost, s.framegen, s.fps, s.res, s.bitrate, s.h264, s.hz120, s.decmode);
 	fclose(f);
 }
 
@@ -288,6 +293,9 @@ static Settings LoadSettings()
 	get("bitrate", s.bitrate, 0, kBitrateCount - 1);
 	get("h264", s.h264, 0, 1);
 	get("hz120", s.hz120, 0, 1);
+	s.res = s.res720 ? 0 : 1;
+	get("res", s.res, 0, 3);
+	get("decmode", s.decmode, 0, 2);
 	return s;
 }
 
@@ -495,6 +503,7 @@ struct Buf
 };
 
 static const uint32_t FRAME_W = 1920, FRAME_H = 1080;
+static const uint32_t VIDEO_MAX_W = 3840, VIDEO_MAX_H = 2160; // largest stream the staging buffers hold
 static const VkFormat FRAME_FMT = VK_FORMAT_R8G8B8A8_UNORM;
 
 struct PushConstants
@@ -661,6 +670,18 @@ public:
 		VkQueueFamilyProperties fams[8];
 		count = 8;
 		vkGetPhysicalDeviceQueueFamilyProperties(physical, &count, fams);
+		for(uint32_t i = 0; i < count; i++)
+			AppLog("queue family %u: flags 0x%x, %u queues (video decode %s)", i, fams[i].queueFlags, fams[i].queueCount,
+				(fams[i].queueFlags & 0x20) ? "YES" : "no");
+		{
+			uint32_t ne = 0;
+			vkEnumerateDeviceExtensionProperties(physical, nullptr, &ne, nullptr);
+			std::vector<VkExtensionProperties> ex(ne);
+			vkEnumerateDeviceExtensionProperties(physical, nullptr, &ne, ex.data());
+			std::string vids;
+			for(auto &e : ex) if(strstr(e.extensionName, "video")) { vids += e.extensionName; vids += ' '; }
+			AppLog("device extensions: %u, video ones: %s", ne, vids.empty() ? "(none)" : vids.c_str());
+		}
 		family = UINT32_MAX;
 		for(uint32_t i = 0; i < count; i++)
 			if((fams[i].queueFlags & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT)) == (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT)) { family = i; break; }
@@ -811,7 +832,7 @@ public:
 			VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT)) return false;
 		if(!MakeImage(texUI, UI_W, UI_H, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)) return false;
 		if(!MakeVideoTextures(16, 16)) return false;
-		VkDeviceSize stSize = (VkDeviceSize)FRAME_W * FRAME_H * 3 / 2 + (VkDeviceSize)UI_W * UI_H * 4 + 4096;
+		VkDeviceSize stSize = (VkDeviceSize)VIDEO_MAX_W * VIDEO_MAX_H * 3 / 2 + (VkDeviceSize)UI_W * UI_H * 4 + 4096;
 		for(auto &s : staging) if(!MakeBuffer(s, stSize)) { AppLog("staging alloc failed"); return false; }
 
 		VkSamplerCreateInfo smp{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
@@ -990,7 +1011,7 @@ public:
 		Layout(cmd, img.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 	}
 
-	VkDeviceSize UiOffset() const { return (VkDeviceSize)FRAME_W * FRAME_H * 3 / 2 + 256; }
+	VkDeviceSize UiOffset() const { return (VkDeviceSize)VIDEO_MAX_W * VIDEO_MAX_H * 3 / 2 + 256; }
 
 	// Begin the slot's command buffer (waits for its previous use).
 	VkCommandBuffer Begin()
@@ -1210,10 +1231,13 @@ public:
 					Decode(p.data(), p.size());
 				}
 				uint64_t dt = NowUs() - t0;
-				if(dt > 20000 && NowUs() - decodeSlowLogged > 2000000)
+				decSum += dt; decN++; if(dt > decMax) decMax = dt;
+				if(NowUs() - decodeSlowLogged > 5000000)
 				{
 					decodeSlowLogged = NowUs();
-					AppLog("slow decode: %llu ms (queue %d)", (unsigned long long)(dt / 1000), (int)pktQueue.size());
+					AppLog("decode: %d frames, avg %.1f ms, max %.1f ms, %ux%u (queue %d)", decN, decN ? decSum / 1000.0 / decN : 0.0,
+						decMax / 1000.0, texWLog, texHLog, (int)pktQueue.size());
+					decSum = 0; decN = 0; decMax = 0;
 				}
 			}
 		});
@@ -1255,7 +1279,21 @@ public:
 	{
 		mkdir(DATA_DIR, 0777);
 		g_logFile = fopen((std::string(DATA_DIR) + "/log.txt").c_str(), "w");
-		AppLog("chiaki-ps5 starting");
+		AppLog("chiaki4ps5 starting");
+		{
+			// which CPU cores this app may use; ask for all 16 so decoding can spread out
+			cpuset_t m;
+			CPU_ZERO(&m);
+			int r = cpuset_getaffinity(CPU_LEVEL_WHICH, CPU_WHICH_PID, -1, sizeof(m), &m);
+			AppLog("cpus online %ld, affinity %d: %d cores", sysconf(_SC_NPROCESSORS_ONLN), r, CPU_COUNT(&m));
+			cpuset_t all;
+			CPU_ZERO(&all);
+			for(int c = 0; c < 16; c++) CPU_SET(c, &all);
+			r = cpuset_setaffinity(CPU_LEVEL_WHICH, CPU_WHICH_PID, -1, sizeof(all), &all);
+			CPU_ZERO(&m);
+			cpuset_getaffinity(CPU_LEVEL_WHICH, CPU_WHICH_PID, -1, sizeof(m), &m);
+			AppLog("set affinity to all: %d, now %d cores", r, CPU_COUNT(&m));
+		}
 		set = LoadSettings();
 		cfg = LoadConfig();
 		FontInit();
@@ -1368,9 +1406,11 @@ public:
 		const AVCodec *codec = avcodec_find_decoder(hevc ? AV_CODEC_ID_HEVC : AV_CODEC_ID_H264);
 		if(!codec) { AppLog("decoder not found"); return false; }
 		dec = avcodec_alloc_context3(codec);
-		dec->thread_count = 4;
-		dec->thread_type = FF_THREAD_SLICE;
-		dec->flags |= AV_CODEC_FLAG_LOW_DELAY;
+		// 0: slice/WPP threads only (no added delay); 1-2: frame threads too (each extra thread adds a frame of delay
+		// but decodes frames side by side, for streams one core can't keep up with)
+		if(set.decmode == 0) { dec->thread_count = 8; dec->thread_type = FF_THREAD_SLICE; dec->flags |= AV_CODEC_FLAG_LOW_DELAY; }
+		else { dec->thread_count = set.decmode == 1 ? 2 : 4; dec->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE; }
+		AppLog("decoder mode %d: %d threads, type %d", set.decmode, dec->thread_count, dec->thread_type);
 		dec->flags2 |= AV_CODEC_FLAG2_FAST;
 		if(avcodec_open2(dec, codec, nullptr) < 0) { AppLog("avcodec_open2 failed"); return false; }
 		avf = av_frame_alloc();
@@ -1401,6 +1441,8 @@ public:
 				continue;
 			}
 			uint32_t w = avf->width & ~1u, h = avf->height & ~1u;
+			if(w > VIDEO_MAX_W || h > VIDEO_MAX_H) continue;
+			texWLog = w; texHLog = h;
 			std::lock_guard<std::mutex> l(frameMutex);
 			frameBuf.resize((size_t)w * h * 3 / 2);
 			uint8_t *d = frameBuf.data();
@@ -1657,7 +1699,7 @@ public:
 		uint64_t cred = strtoull(std::string(host.rp_regist_key, strnlen(host.rp_regist_key, sizeof(host.rp_regist_key))).c_str(), nullptr, 16);
 		chiaki_discovery_wakeup(&log, nullptr, cfg.host.c_str(), cred, true);
 
-		bool hevc = !set.h264;
+		bool hevc = !set.h264 || set.res >= 2; // above 1080p needs HEVC
 		if(!InitDecoder(hevc)) { Fail("Could not start the video decoder"); return; }
 		StartDecodeThread();
 
@@ -1675,8 +1717,11 @@ public:
 		memcpy(ci.regist_key, host.rp_regist_key, sizeof(ci.regist_key));
 		memcpy(ci.morning, host.rp_key, sizeof(ci.morning));
 		chiaki_connect_video_profile_preset(&ci.video_profile,
-			set.res720 ? CHIAKI_VIDEO_RESOLUTION_PRESET_720p : CHIAKI_VIDEO_RESOLUTION_PRESET_1080p,
+			set.res == 0 ? CHIAKI_VIDEO_RESOLUTION_PRESET_720p : CHIAKI_VIDEO_RESOLUTION_PRESET_1080p,
 			streamIs30 ? CHIAKI_VIDEO_FPS_PRESET_30 : CHIAKI_VIDEO_FPS_PRESET_60);
+		// experimental: ask for more than 1080p; the console answers with what it can do (auto downgrade)
+		if(set.res == 2) { ci.video_profile.width = 2560; ci.video_profile.height = 1440; }
+		if(set.res == 3) { ci.video_profile.width = 3840; ci.video_profile.height = 2160; }
 		ci.video_profile.codec = hevc ? CHIAKI_CODEC_H265 : CHIAKI_CODEC_H264;
 		ci.video_profile.bitrate = kBitrates[set.bitrate];
 		ci.video_profile_auto_downgrade = true;
@@ -1688,7 +1733,7 @@ public:
 		memcpy(ci.psn_account_id, accountId, sizeof(accountId));
 		ci.packet_loss_max = 0.05;
 		ci.enable_idr_on_fec_failure = true;
-		AppLog("connect: %s %s %d kbps, frame gen %d", set.res720 ? "720p" : "1080p", hevc ? "HEVC" : "H.264", kBitrates[set.bitrate], fgMode);
+		AppLog("connect: %s %s %d kbps, frame gen %d", ResName(set.res), hevc ? "HEVC" : "H.264", kBitrates[set.bitrate], fgMode);
 
 		ChiakiErrorCode err = chiaki_session_init(&session, &ci, &log);
 		if(err != CHIAKI_ERR_SUCCESS) { Fail(std::string("Session init failed: ") + chiaki_error_string(err)); return; }
@@ -1709,6 +1754,7 @@ public:
 			{
 				case CHIAKI_EVENT_CONNECTED:
 					AppLog("connected");
+					self->inUseRetries = 0;
 					self->state = State::Streaming;
 					self->uiDirty = true;
 					break;
@@ -1722,8 +1768,17 @@ public:
 					std::string m = std::string("Disconnected: ") + chiaki_quit_reason_string(ev->quit.reason);
 					if(ev->quit.reason_str) m += std::string(" - ") + ev->quit.reason_str;
 					AppLog("%s", m.c_str());
-					self->Status(m + "  (X: reconnect, O: profiles)");
 					self->sessionQuit = true;
+					if(ev->quit.reason == CHIAKI_QUIT_REASON_SESSION_REQUEST_RP_IN_USE && self->inUseRetries < 10)
+					{
+						// the console lets go of the last session a few seconds after it ends: try again shortly
+						self->inUseRetries++;
+						self->retryAt = NowUs() + 2000000;
+						self->Status("The console is still finishing the last session... retrying (" + std::to_string(self->inUseRetries) + "/10)");
+						self->state = State::Connecting;
+						break;
+					}
+					self->Status(m + "  (X: reconnect, O: profiles)");
 					self->state = State::Error;
 					break;
 				}
@@ -1807,7 +1862,8 @@ public:
 		chiaki_session_set_controller_state(&session, &cs);
 	}
 
-	static const int MENU_ITEMS = 13;
+	static const int MENU_ITEMS = 14;
+	static const char *ResName(int r) { static const char *n[] = {"720p", "1080p", "1440p", "4K"}; return n[r & 3]; }
 	std::string MenuLabel(int i)
 	{
 		char b[128];
@@ -1820,12 +1876,13 @@ public:
 			case 3: snprintf(b, sizeof(b), "Color boost         < %s >", lvl[set.boost]); break;
 			case 4: snprintf(b, sizeof(b), "Frame gen *         < %s >", set.framegen == 0 ? "Off" : set.framegen == 1 ? "30 -> 60" : "60 -> 120"); break;
 			case 5: snprintf(b, sizeof(b), "FPS counter         < %s >", set.fps ? "On" : "Off"); break;
-			case 6: snprintf(b, sizeof(b), "Resolution *        < %s >", set.res720 ? "720p" : "1080p"); break;
+			case 6: snprintf(b, sizeof(b), "Resolution *        < %s%s >", ResName(set.res), set.res >= 2 ? " (beta)" : ""); break;
 			case 7: snprintf(b, sizeof(b), "Bitrate *           < %d Mbps >", kBitrates[set.bitrate] / 1000); break;
 			case 8: snprintf(b, sizeof(b), "Codec *             < %s >", set.h264 ? "H.264" : "HEVC"); break;
-			case 9: snprintf(b, sizeof(b), "Press PS button  (or Options+Down)"); break;
-			case 10: snprintf(b, sizeof(b), "Reconnect now (applies *)"); break;
-			case 11: snprintf(b, sizeof(b), "Disconnect"); break;
+			case 9: snprintf(b, sizeof(b), "Decoder *           < %s >", set.decmode == 0 ? "Low latency" : set.decmode == 1 ? "Fast" : "Fastest"); break;
+			case 10: snprintf(b, sizeof(b), "Press PS button  (or Options+Down)"); break;
+			case 11: snprintf(b, sizeof(b), "Reconnect now (applies *)"); break;
+			case 12: snprintf(b, sizeof(b), "Disconnect"); break;
 			default: snprintf(b, sizeof(b), "Close menu"); break;
 		}
 		return b;
@@ -1842,23 +1899,27 @@ public:
 			case 3: cyc(set.boost, 3); break;
 			case 4: cyc(set.framegen, 3); break;
 			case 5: cyc(set.fps, 2); break;
-			case 6: cyc(set.res720, 2); break;
+			case 6: cyc(set.res, 4); break;
 			case 7: set.bitrate = set.bitrate + dir < 0 ? 0 : set.bitrate + dir >= kBitrateCount ? kBitrateCount - 1 : set.bitrate + dir; break;
 			case 8: cyc(set.h264, 2); break;
+			case 9: cyc(set.decmode, 3); break;
 			default: return;
 		}
 		SaveSettings(set);
 		uiDirty = true;
 	}
 
+	uint64_t decSum = 0, decMax = 0; int decN = 0; uint32_t texWLog = 0, texHLog = 0;
 	bool reconnectRequested = false, disconnectRequested = false;
+	int inUseRetries = 0;
+	uint64_t retryAt = 0;
 	void MenuActivate()
 	{
 		holdUntilRelease = true;
-		if(menuIdx == 9) { menuOpen = false; psUntil = NowUs() + 250000; AppLog("PS button sent (menu)"); }
-		else if(menuIdx == 10) { reconnectRequested = true; menuOpen = false; }
-		else if(menuIdx == 11) { disconnectRequested = true; menuOpen = false; }
-		else if(menuIdx == 12) menuOpen = false;
+		if(menuIdx == 10) { menuOpen = false; psUntil = NowUs() + 250000; AppLog("PS button sent (menu)"); }
+		else if(menuIdx == 11) { reconnectRequested = true; menuOpen = false; }
+		else if(menuIdx == 12) { disconnectRequested = true; menuOpen = false; }
+		else if(menuIdx == 13) menuOpen = false;
 		else MenuAdjust(1);
 		uiDirty = true;
 	}
@@ -2093,7 +2154,7 @@ public:
 		else hint = "X  Select      Left / Right  Move      Down  Profiles";
 		UiText(20, 516, hint.c_str(), CDim(), 1);
 		if(active && !status.empty() && status != "Who's playing?") UiTextCentered(486, status.c_str(), CAccent(), 1);
-		UiText(905, 516, "v1.1", CDim(), 1);
+		UiText(905, 516, "v1.2", CDim(), 1);
 		if(!gfx.fgReady) UiText(560, 516, "frame gen unavailable", CDim(), 1);
 	}
 
@@ -2228,7 +2289,7 @@ public:
 				UiRect(580, 74, 340, 2, RGBA(0, 167, 255, 255));
 				for(int i = 0; i < MENU_ITEMS; i++)
 				{
-					int y = 84 + i * 29;
+					int y = 84 + i * 27;
 					if(i == menuIdx) UiRoundRect(570, y - 5, 360, 26, 5, RGBA(0, 167, 255, 255));
 					UiText(584, y, MenuLabel(i).c_str(), white, 1);
 				}
@@ -2266,7 +2327,8 @@ public:
 			if(registDone.exchange(false) && registActive) { chiaki_regist_stop(&regist); chiaki_regist_fini(&regist); registActive = false; }
 			if(wantConnect.exchange(false)) Connect();
 			if(sessionQuit.exchange(false)) { /* stay in Error until the user picks */ }
-			if(reconnectRequested) { reconnectRequested = false; StopSession(); Connect(); }
+			if(reconnectRequested) { reconnectRequested = false; inUseRetries = 0; StopSession(); Connect(); }
+			if(retryAt && NowUs() >= retryAt) { retryAt = 0; StopSession(); Connect(); }
 			if(disconnectRequested) { disconnectRequested = false; StopSession(); GoProfiles(); }
 
 			// wait for a new video frame (or time out for UI)
